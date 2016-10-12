@@ -15,28 +15,31 @@
  */
 package com.googlecode.tesseract.android;
 
+import com.crashlytics.android.Crashlytics;
 import com.googlecode.leptonica.android.Boxa;
 import com.googlecode.leptonica.android.Pix;
 import com.googlecode.leptonica.android.Pixa;
 import com.googlecode.leptonica.android.WriteFile;
 import com.googlecode.tesseract.android.TessBaseAPI.PageSegMode;
+import com.renard.ocr.MonitoredActivity;
 import com.renard.ocr.R;
-import com.renard.ocr.cropimage.MonitoredActivity;
-import com.renard.util.Util;
+import com.renard.ocr.TextFairyApplication;
+import com.renard.ocr.analytics.Analytics;
+import com.renard.ocr.documents.creation.crop.CropImageScaler;
+import com.renard.ocr.main_menu.language.OcrLanguage;
+import com.renard.ocr.util.MemoryInfo;
+import com.renard.ocr.util.Util;
 
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.RectF;
-import android.os.AsyncTask;
 import android.os.Bundle;
 import android.os.Message;
 import android.os.Messenger;
 import android.os.RemoteException;
-import android.text.TextUtils;
 import android.util.Log;
 
 import java.io.File;
-import java.io.IOException;
 
 public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgressListener {
 
@@ -54,6 +57,7 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
     public static final int MESSAGE_EXPLANATION_TEXT = 12;
     public static final String EXTRA_WORD_BOX = "word_box";
     public static final String EXTRA_OCR_BOX = "ocr_box";
+    private static final String LOG_TAG = OCR.class.getSimpleName();
 
     static {
         System.loadLibrary("pngo");
@@ -63,6 +67,9 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
         nativeInit();
 
     }
+
+    private final Analytics mAnalytics;
+    private final Context mApplicationContext;
 
     private int mPreviewWith;
     private int mPreviewHeight;
@@ -75,8 +82,13 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
 
     protected TessBaseAPI mTess;
     private boolean mStopped;
+    private int mPreviewHeightUnScaled;
+    private int mPreviewWidthUnScaled;
+    private boolean mCompleted;
 
     public OCR(final MonitoredActivity activity, final Messenger messenger) {
+        mApplicationContext = activity.getApplicationContext();
+        mAnalytics = activity.getAnaLytics();
         mMessenger = messenger;
         mIsActivityAttached = true;
         activity.addLifeCycleListener(this);
@@ -89,10 +101,15 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
         if (mMessenger != null && mIsActivityAttached) {
             Log.i(TAG, "onProgressImage " + nativePix);
             Pix preview = new Pix(nativePix);
-            final Bitmap previewBitmap = WriteFile.writeBitmap(preview);
-            mPreviewHeight = preview.getHeight();
-            mPreviewWith = preview.getWidth();
-            sendMessage(MESSAGE_PREVIEW_IMAGE, previewBitmap);
+            CropImageScaler scaler = new CropImageScaler();
+            final CropImageScaler.ScaleResult scale = scaler.scale(preview, mPreviewWidthUnScaled, mPreviewHeightUnScaled);
+            final Bitmap previewBitmap = WriteFile.writeBitmap(scale.getPix());
+            if (previewBitmap != null) {
+                scale.getPix().recycle();
+                mPreviewHeight = previewBitmap.getHeight();
+                mPreviewWith = previewBitmap.getWidth();
+                sendMessage(MESSAGE_PREVIEW_IMAGE, previewBitmap);
+            }
         }
     }
 
@@ -107,6 +124,7 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
      * @param bottom  edge of current word boundary
      */
     public void onProgressValues(final int percent, final int left, final int right, final int top, final int bottom, final int left2, final int right2, final int top2, final int bottom2) {
+        logProgressToCrashlytics(percent);
         int newBottom = (bottom2 - top2) - bottom;
         int newTop = (bottom2 - top2) - top;
         // scale the word bounding rectangle to the preview image space
@@ -118,6 +136,14 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
         b.putParcelable(EXTRA_OCR_BOX, mOCRBoundingBox);
         b.putParcelable(EXTRA_WORD_BOX, mWordBoundingBox);
         sendMessage(MESSAGE_TESSERACT_PROGRESS, percent, b);
+    }
+
+    private void logProgressToCrashlytics(int percent) {
+        if (TextFairyApplication.isRelease()) {
+            long availableMegs = MemoryInfo.getFreeMemory(mApplicationContext);
+            Crashlytics.log("available ram = " + availableMegs);
+            Crashlytics.setInt("ocr progress", percent);
+        }
     }
 
     /**
@@ -158,7 +184,19 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
      * @param nativePix pix pointer
      */
     private void onLayoutPix(long nativePix) {
-        sendMessage(MESSAGE_LAYOUT_PIX, nativePix);
+        if (mMessenger != null && mIsActivityAttached) {
+            Log.i(TAG, "onLayoutPix " + nativePix);
+            Pix preview = new Pix(nativePix);
+            CropImageScaler scaler = new CropImageScaler();
+            final CropImageScaler.ScaleResult scale = scaler.scale(preview, mPreviewWidthUnScaled, mPreviewHeightUnScaled);
+            final Bitmap previewBitmap = WriteFile.writeBitmap(scale.getPix());
+            if (previewBitmap != null) {
+                scale.getPix().recycle();
+                sendMessage(MESSAGE_LAYOUT_PIX, previewBitmap);
+            } else {
+                sendMessage(MESSAGE_ERROR, R.string.error_title);
+            }
+        }
     }
 
     /**
@@ -244,6 +282,47 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
         mIsActivityAttached = true;
     }
 
+    private int determineOcrMode(String lang) {
+        boolean hasCubeSupport = OcrLanguage.hasCubeSupport(lang);
+        boolean canCombine = OcrLanguage.canCombineCubeAndTesseract(lang);
+        if (canCombine) {
+            return TessBaseAPI.OEM_TESSERACT_CUBE_COMBINED;
+        } else if (hasCubeSupport) {
+            return TessBaseAPI.OEM_DEFAULT;
+        } else {
+            return TessBaseAPI.OEM_TESSERACT_ONLY;
+        }
+    }
+
+
+    private String determineOcrLanguage(String ocrLanguage) {
+        final String english = "eng";
+        if (!ocrLanguage.equals(english) && addEnglishData(ocrLanguage)) {
+            return ocrLanguage + "+" + english;
+        } else {
+            return ocrLanguage;
+        }
+
+    }
+
+    // when combining languages that have multi byte characters with english
+    // training data the ocr text gets corrupted
+    // but adding english will improve overall accuracy for the other languages
+    private boolean addEnglishData(String mLanguage) {
+        return !(mLanguage.startsWith("chi") || mLanguage.equalsIgnoreCase("tha")
+                || mLanguage.equalsIgnoreCase("kor")
+                //|| mLanguage.equalsIgnoreCase("hin")
+                //|| mLanguage.equalsIgnoreCase("heb")
+                || mLanguage.equalsIgnoreCase("jap")
+                //|| mLanguage.equalsIgnoreCase("ell")
+                || mLanguage.equalsIgnoreCase("bel")
+                || mLanguage.equalsIgnoreCase("ara")
+                || mLanguage.equalsIgnoreCase("grc")
+                || mLanguage.equalsIgnoreCase("rus")
+                || mLanguage.equalsIgnoreCase("vie"));
+    }
+
+
     /**
      * native code takes care of both Pixa, do not use them after calling this
      * function
@@ -271,8 +350,11 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
                     Boxa boxa;
                     Pix pixOcr;
                     synchronized (OCR.this) {
+                        logMemory(context);
+                        final String ocrLanguages = determineOcrLanguage(lang);
+                        int ocrMode = determineOcrMode(lang);
 
-                        if (!initTessApi(tessDir, lang)) return;
+                        if (!initTessApi(tessDir, ocrLanguages, ocrMode)) return;
                         pixOcr = new Pix(pixOcrPointer);
                         mTess.setPageSegMode(PageSegMode.PSM_SINGLE_BLOCK);
                         mTess.setImage(pixOcr);
@@ -320,24 +402,43 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
                     sendMessage(MESSAGE_HOCR_TEXT, hocrText.toString(), totalAccuracy);
                     sendMessage(MESSAGE_UTF8_TEXT, htmlText.toString(), totalAccuracy);
                 } finally {
-                    if(mTess!=null) {
+                    if (mTess != null) {
                         mTess.end();
                     }
+                    mCompleted = true;
                     sendMessage(MESSAGE_END);
                 }
             }
         }).start();
     }
 
-    private boolean initTessApi(String tessDir, String lang) {
+
+    private boolean initTessApi(String tessDir, String lang, int ocrMode) {
+        logTessParams(lang, ocrMode);
         mTess = new TessBaseAPI(OCR.this);
-        boolean result = mTess.init(tessDir, lang);
+        boolean result = mTess.init(tessDir, lang, ocrMode);
         if (!result) {
             sendMessage(MESSAGE_ERROR, R.string.error_tess_init);
             return false;
         }
-        mTess.setVariable(TessBaseAPI.VAR_CHAR_BLACKLIST,"ﬀﬁﬂﬃﬄﬅﬆ");
+        mTess.setVariable(TessBaseAPI.VAR_CHAR_BLACKLIST, "ﬀﬁﬂﬃﬄﬅﬆ");
         return true;
+    }
+
+    private void logTessParams(String lang, int ocrMode) {
+        if (TextFairyApplication.isRelease()) {
+            String pageSegMode = "";
+            if (ocrMode == TessBaseAPI.OEM_TESSERACT_ONLY) {
+                pageSegMode = "OEM_TESSERACT_ONLY";
+            } else if (ocrMode == TessBaseAPI.OEM_TESSERACT_CUBE_COMBINED) {
+                pageSegMode = "OEM_TESSERACT_CUBE_COMBINED";
+                Crashlytics.setString("page seg mode", "OEM_TESSERACT_CUBE_COMBINED");
+            } else if (ocrMode == TessBaseAPI.OEM_DEFAULT) {
+                pageSegMode = "OEM_DEFAULT";
+            }
+            Crashlytics.setString("page seg mode", pageSegMode);
+            Crashlytics.setString("ocr language", lang);
+        }
     }
 
     /**
@@ -346,12 +447,14 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
      *
      * @param pixs source pix on which to do layout analysis
      */
-    public void startLayoutAnalysis(final Context context, final Pix pixs) {
+    public void startLayoutAnalysis(final Context context, final Pix pixs, int width, int height) {
 
         if (pixs == null) {
             throw new IllegalArgumentException("Source pix must be non-null");
         }
 
+        mPreviewHeightUnScaled = height;
+        mPreviewWidthUnScaled = width;
         mOriginalHeight = pixs.getHeight();
         mOriginalWidth = pixs.getWidth();
 
@@ -367,14 +470,15 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
      * native code takes care of the Pix, do not use it after calling this
      * function
      *
-     * @param pixs    source pix to do ocr on
      * @param context used to access the file system
+     * @param pixs    source pix to do ocr on
      */
-    public void startOCRForSimpleLayout(final Context context, final String lang, final Pix pixs) {
+    public void startOCRForSimpleLayout(final Context context, final String lang, final Pix pixs, int width, int height) {
         if (pixs == null) {
             throw new IllegalArgumentException("Source pix must be non-null");
         }
-
+        mPreviewHeightUnScaled = height;
+        mPreviewWidthUnScaled = width;
         mOriginalHeight = pixs.getHeight();
         mOriginalWidth = pixs.getWidth();
 
@@ -382,38 +486,56 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
             @Override
             public void run() {
                 try {
+                    logMemory(context);
                     final String tessDir = Util.getTessDir(context);
                     long nativeTextPix = nativeOCRBook(pixs.getNativePix());
-                    pixs.recycle();
                     Pix pixText = new Pix(nativeTextPix);
                     mOriginalHeight = pixText.getHeight();
                     mOriginalWidth = pixText.getWidth();
                     sendMessage(MESSAGE_EXPLANATION_TEXT, R.string.progress_ocr);
                     sendMessage(MESSAGE_FINAL_IMAGE, nativeTextPix);
                     synchronized (OCR.this) {
-                        if (!initTessApi(tessDir, lang)) return;
+                        if (mStopped) {
+                            return;
+                        }
+                        final String ocrLanguages = determineOcrLanguage(lang);
+                        int ocrMode = determineOcrMode(lang);
+                        if (!initTessApi(tessDir, ocrLanguages, ocrMode)) return;
+
                         mTess.setPageSegMode(PageSegMode.PSM_AUTO);
                         mTess.setImage(pixText);
                     }
                     String hocrText = mTess.getHOCRText(0);
+                    int accuracy = mTess.meanConfidence();
+                    final String utf8Text = mTess.getUTF8Text();
+
+                    if (utf8Text.isEmpty()) {
+                        Log.i(LOG_TAG, "No words found. Looking for sparse text.");
+                        mTess.setPageSegMode(PageSegMode.PSM_SPARSE_TEXT);
+                        mTess.setImage(pixText);
+                        hocrText = mTess.getHOCRText(0);
+                        accuracy = mTess.meanConfidence();
+                    }
+
                     synchronized (OCR.this) {
                         if (mStopped) {
                             return;
                         }
                         String htmlText = mTess.getHtmlText();
-                        int accuracy = mTess.meanConfidence();
-                        if (accuracy==95) {
+                        if (accuracy == 95) {
                             accuracy = 0;
                         }
+
                         sendMessage(MESSAGE_HOCR_TEXT, hocrText, accuracy);
                         sendMessage(MESSAGE_UTF8_TEXT, htmlText, accuracy);
                     }
 
 
                 } finally {
-                    if(mTess!=null) {
+                    if (mTess != null) {
                         mTess.end();
                     }
+                    mCompleted = true;
                     sendMessage(MESSAGE_END);
                 }
             }
@@ -421,31 +543,14 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
 
     }
 
-    private static class SavePixTask extends AsyncTask<Void, Void, File> {
-        private final Pix mPix;
-        private final File mDir;
-
-        SavePixTask(Pix pix, File dir) {
-            mPix = pix;
-            mDir = dir;
+    private void logMemory(Context context) {
+        if (TextFairyApplication.isRelease()) {
+            final long freeMemory = MemoryInfo.getFreeMemory(context);
+            Crashlytics.setLong("Memory", freeMemory);
         }
-
-        @Override
-        protected File doInBackground(Void... params) {
-            try {
-                return Util.savePixToDir(mPix, ORIGINAL_PIX_NAME, mDir);
-            } catch (IOException e) {
-                e.printStackTrace();
-            } finally {
-                mPix.recycle();
-            }
-
-            return null;
-        }
-
     }
 
-    private final static String ORIGINAL_PIX_NAME = "last_scan";
+    final static String ORIGINAL_PIX_NAME = "last_scan";
 
 
     public static void savePixToCacheDir(Context context, Pix pix) {
@@ -462,17 +567,26 @@ public class OCR extends MonitoredActivity.LifeCycleAdapter implements OcrProgre
 
     public synchronized void cancel() {
         if (mTess != null) {
+            if (!mCompleted) {
+                mAnalytics.sendOcrCancelled();
+            }
             mTess.stop();
-            mStopped = true;
         }
+        mStopped = true;
     }
 
-    // ***************
-    // * NATIVE CODE *
-    // ***************
+
+//    public static native void startCaptureLogs();
+//
+//    public static native String stopCaptureLogs();
 
     private static native void nativeInit();
 
+    /**
+     * takes ownership of nativePix.
+     *
+     * @return binarized and dewarped version of input pix
+     */
     private native long nativeOCRBook(long nativePix);
 
     private native long[] combineSelectedPixa(long nativePixaTexts, long nativePixaImages, int[] selectedTexts, int[] selectedImages);

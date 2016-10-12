@@ -22,7 +22,6 @@
 #include <iomanip>
 #include <cmath>
 #include <cctype>
-
 #include <vector>
 
 #include "Codecs.hh"
@@ -44,7 +43,28 @@ int hocr2pdf(const char* imageFileName, const char* hocrText, PDFCodec* pdfConte
 	  std::string fileName(imageFileName);
 	  if (!ImageCodec::Read(fileName, image)) {
 		  LOGI("Error reading input file.");
-		  return 1;
+          overlayImage = false;
+        std::string hocrString(hocrText);
+        std::size_t startPos = hocrString.find("bbox", 0);
+        if (startPos!=std::string::npos) {
+            std::size_t endPos = hocrString.find(";", startPos);
+            if (endPos!=std::string::npos) {
+                std::string subString =  hocrString.substr(startPos, endPos-startPos);
+                LOGI("size string = %s",subString.c_str());
+                std::string buf;
+                std::stringstream ss(subString);
+                std::vector<std::string> tokens;
+
+                while (ss >> buf) {
+                    tokens.push_back(buf);
+                }
+                std::stringstream(tokens[3]) >> image.w;
+                std::stringstream(tokens[4]) >> image.h;
+
+                LOGI("image size = %i, %i, ", image.w, image.h);
+
+            }
+        }
 	  }
 
 	  if (image.resolutionX() <= 0 || image.resolutionY() <= 0) {
@@ -55,6 +75,8 @@ int hocr2pdf(const char* imageFileName, const char* hocrText, PDFCodec* pdfConte
 	  unsigned int res = image.resolutionX();
 
 	  std::stringstream hocr(hocrText);
+    
+      LOGI("paged dimensions %.2f, %.2f", 72. * image.w / res, 72. * image.h / res);
 
 
 	  pdfContext->beginPage(72. * image.w / res, 72. * image.h / res);
@@ -81,7 +103,7 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 
 
-void Java_com_renard_pdf_Hocr2Pdf_nativeHocr2pdf( JNIEnv* env, jobject thiz, jobjectArray imageStrings, jobjectArray hocrBytes, jstring out, jboolean sloppy, jboolean overlayImage)
+void Java_com_renard_ocr_pdf_Hocr2Pdf_nativeHocr2pdf( JNIEnv* env, jobject thiz, jobjectArray imageStrings, jobjectArray hocrBytes, jstring out, jboolean sloppy, jboolean overlayImage)
 {
   LOGI("Java_com_renard_pdf_Hocr2Pdf_nativeHocr2pdf");
 

@@ -7,8 +7,7 @@
         android:layout_width="match_parent"
         android:orientation="vertical">
 
-    <TextView xmlns:android="http://schemas.android.com/apk/res/android"
-              android:padding="@dimen/default_padding"
+    <TextView android:padding="@dimen/default_padding"
               android:id="@+id/fairy_text"
               android:textSize="18sp"
               android:layout_width="match_parent"
@@ -21,12 +20,6 @@
               android:textAppearance="@style/FairySpeechbubble">
 
     </TextView>
-    <View
-            android:layout_marginTop="@dimen/default_padding_half"
-            android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:id="@+id/divider1"
-            android:background="@color/grey6"/>
 
     <TextView android:text="@string/feedback_description"
               android:textSize="16sp"
